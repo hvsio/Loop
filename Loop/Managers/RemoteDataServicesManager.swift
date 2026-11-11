@@ -55,6 +55,8 @@ final class RemoteDataServicesManager {
             unlockedRemoteDataServices.append(remoteDataService)
         }
         uploadExistingData(to: remoteDataService)
+        let now = Date()
+        uploadPumpSnapshot(to: remoteDataService, start: now.addingTimeInterval(-30 * 24 * 60 * 60), now: now)
     }
 
     func restoreService(_ remoteDataService: RemoteDataService) {
@@ -206,6 +208,12 @@ final class RemoteDataServicesManager {
                 remoteDataServices.forEach { self.uploadTemporaryOverrideData(to: $0) }
             }
         }
+
+        if triggeringType == .dose {
+            let now = Date()
+            let start = now.addingTimeInterval(-26 * 60 * 60)
+            remoteDataServices.forEach { uploadPumpSnapshot(to: $0, start: start, now: now) }
+        }
     }
     
     func triggerUpload(for triggeringType: RemoteDataType, completion: @escaping () -> Void) {
@@ -220,6 +228,43 @@ final class RemoteDataServicesManager {
             triggerUpload(for: triggeringType) {
                 continuation.resume(returning: ())
             }
+        }
+    }
+}
+
+extension RemoteDataServicesManager {
+    private func uploadPumpSnapshot(to remoteDataService: RemoteDataService, start: Date, now: Date) {
+        guard let snapshotService = remoteDataService as? RemotePumpSnapshotService else { return }
+
+        uploadGroup.enter()
+
+        let key = UploadTaskKey(serviceIdentifier: remoteDataService.pluginIdentifier, remoteDataType: .dose)
+
+        dispatchQueue(key).async {
+            let semaphore = DispatchSemaphore(value: 0)
+            self.insulinDeliveryStore.getDoseEntries(start: start, end: now, includeMutable: false) { result in
+                switch result {
+                case .failure(let error):
+                    self.log.error("Error querying insulin delivery snapshot: %{public}@", String(describing: error))
+                    semaphore.signal()
+                case .success(let entries):
+                    let basal = entries.filter { [.basal, .tempBasal, .suspend].contains($0.type) }
+                    let boluses = entries.filter { $0.type == .bolus }
+                    snapshotService.uploadPumpSnapshot(basal: basal, boluses: boluses, carbs: [], now: now) { result in
+                        switch result {
+                        case .failure(let error):
+                            self.log.error("Error synchronizing insulin delivery snapshot: %{public}@", String(describing: error))
+                            self.uploadFailed(key)
+                        case .success:
+                            self.uploadSucceeded(key)
+                        }
+                        semaphore.signal()
+                    }
+                }
+            }
+
+            semaphore.wait()
+            self.uploadGroup.leave()
         }
     }
 }
