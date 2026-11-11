@@ -55,14 +55,14 @@ final class RemoteDataServicesManager {
             unlockedRemoteDataServices.append(remoteDataService)
         }
         uploadExistingData(to: remoteDataService)
-        let now = Date()
-        uploadPumpSnapshot(to: remoteDataService, start: now.addingTimeInterval(-30 * 24 * 60 * 60), now: now)
+        uploadPumpSnapshot(to: remoteDataService)
     }
 
     func restoreService(_ remoteDataService: RemoteDataService) {
         lock.withLock {
             unlockedRemoteDataServices.append(remoteDataService)
         }
+        uploadPumpSnapshot(to: remoteDataService)
     }
 
     func removeService(_ remoteDataService: RemoteDataService) {
@@ -210,9 +210,7 @@ final class RemoteDataServicesManager {
         }
 
         if triggeringType == .dose {
-            let now = Date()
-            let start = now.addingTimeInterval(-26 * 60 * 60)
-            remoteDataServices.forEach { uploadPumpSnapshot(to: $0, start: start, now: now) }
+            remoteDataServices.forEach { uploadPumpSnapshot(to: $0) }
         }
     }
     
@@ -233,7 +231,7 @@ final class RemoteDataServicesManager {
 }
 
 extension RemoteDataServicesManager {
-    private func uploadPumpSnapshot(to remoteDataService: RemoteDataService, start: Date, now: Date) {
+    private func uploadPumpSnapshot(to remoteDataService: RemoteDataService) {
         guard let snapshotService = remoteDataService as? RemotePumpSnapshotService else { return }
 
         uploadGroup.enter()
@@ -242,6 +240,11 @@ extension RemoteDataServicesManager {
 
         dispatchQueue(key).async {
             let semaphore = DispatchSemaphore(value: 0)
+            let now = Date()
+            let isBackfill = snapshotService.needsPumpSnapshotBackfill
+            let window: TimeInterval = isBackfill ? 30 * 24 * 60 * 60 : 26 * 60 * 60
+            let start = now.addingTimeInterval(-window)
+
             self.insulinDeliveryStore.getDoseEntries(start: start, end: now, includeMutable: false) { result in
                 switch result {
                 case .failure(let error):
@@ -250,7 +253,12 @@ extension RemoteDataServicesManager {
                 case .success(let entries):
                     let basal = entries.filter { [.basal, .tempBasal, .suspend].contains($0.type) }
                     let boluses = entries.filter { $0.type == .bolus }
-                    snapshotService.uploadPumpSnapshot(basal: basal, boluses: boluses, carbs: [], now: now) { result in
+                    guard !basal.isEmpty || !boluses.isEmpty else {
+                        semaphore.signal()
+                        return
+                    }
+                    snapshotService.uploadPumpSnapshot(basal: basal, boluses: boluses, carbs: [], now: now,
+                                                        isBackfill: isBackfill) { result in
                         switch result {
                         case .failure(let error):
                             self.log.error("Error synchronizing insulin delivery snapshot: %{public}@", String(describing: error))
